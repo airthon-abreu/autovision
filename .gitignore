@@ -1,0 +1,33 @@
+# Python / Ambiente Virtual
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Banco de Dados & Backups (Segurança de Dados)
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
+backups/
+oficina.db
+
+# Frontend / Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+.vite/
+
+# PyInstaller / Build do Executável
+build/
+*.exe
+*.log
+
+# Editores & SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
