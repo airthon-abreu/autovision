@@ -1,0 +1,2667 @@
+# HAHNGOFF DE CÓDIGO - SISTEMA DE CONTROLE DE BOLETOS
+# Este arquivo consolida o código-fonte atual para análise e suporte.
+
+
+============================================================
+CAMINHO DO FICHEIRO: backend\config.py
+============================================================
+
+import sys
+import os
+from pathlib import Path
+
+def obter_diretorio_base() -> Path:
+    """
+    Retorna o diretório permanente onde o .exe está localizado.
+    Em desenvolvimento, retorna a raiz do repositório.
+    """
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+def obter_diretorio_recursos() -> Path:
+    """
+    Retorna o diretório dos arquivos estáticos do frontend com proteção
+    para todas as versões do PyInstaller (_MEIPASS, _internal ou raiz).
+    """
+    if getattr(sys, 'frozen', False):
+        # 1. Verifica no _MEIPASS temporário
+        if hasattr(sys, '_MEIPASS'):
+            p_mei = Path(sys._MEIPASS)
+            if (p_mei / "frontend" / "dist").exists():
+                return p_mei
+        
+        # 2. Verifica dentro da pasta _internal ao lado do .exe (PyInstaller 6+ onedir)
+        exe_dir = Path(sys.executable).resolve().parent
+        if (exe_dir / "_internal" / "frontend" / "dist").exists():
+            return exe_dir / "_internal"
+            
+        # 3. Verifica diretamente ao lado do .exe
+        if (exe_dir / "frontend" / "dist").exists():
+            return exe_dir
+
+    return Path(__file__).resolve().parent.parent
+
+DIRETORIO_BASE = obter_diretorio_base()
+CAMINHO_BANCO = DIRETORIO_BASE / 'oficina.db'
+PASTA_BACKUPS = DIRETORIO_BASE / 'backups'
+
+
+============================================================
+CAMINHO DO FICHEIRO: backend\database.py
+============================================================
+
+import sqlite3
+import calendar
+from datetime import datetime
+from contextlib import contextmanager
+from backend.config import CAMINHO_BANCO
+
+@contextmanager
+def obter_conexao():
+    """
+    Gerenciador de contexto que garante conexão aberta com WAL ativado,
+    commit automático ao sair com sucesso, rollback em exceção e fechamento garantido.
+    """
+    conexao = sqlite3.connect(str(CAMINHO_BANCO), timeout=30.0)
+    conexao.row_factory = sqlite3.Row
+    conexao.execute("PRAGMA journal_mode=WAL;")
+    conexao.execute("PRAGMA foreign_keys=ON;")
+    try:
+        yield conexao
+        conexao.commit()
+    except Exception:
+        conexao.rollback()
+        raise
+    finally:
+        conexao.close()
+
+def criar_tabelas():
+    with obter_conexao() as conexao:
+        cursor = conexao.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS boletos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                distribuidora TEXT NOT NULL,
+                numero_nota TEXT,
+                valor_parcela REAL NOT NULL,
+                data_emissao DATE,
+                data_vencimento DATE NOT NULL,
+                parcela_atual INTEGER,
+                total_parcelas INTEGER,
+                status TEXT DEFAULT 'Aberto'
+            )
+        ''')
+    print("[Banco] Tabela 'boletos' verificada/criada com sucesso.")
+
+def calcular_novo_mes(data_base: datetime, meses_a_adicionar: int) -> str:
+    """
+    Avança exatamente N meses mantendo o dia fixo do vencimento, 
+    respeitando meses de 28, 30 e 31 dias (inclusive anos bissextos).
+    """
+    ano = data_base.year + (data_base.month + meses_a_adicionar - 1) // 12
+    mes = (data_base.month + meses_a_adicionar - 1) % 12 + 1
+    ultimo_dia_mes = calendar.monthrange(ano, mes)[1]
+    dia = min(data_base.day, ultimo_dia_mes)
+    return datetime(ano, mes, dia).strftime('%Y-%m-%d')
+
+def cadastrar_boleto(distribuidora, numero_nota, valor, data_emissao, data_vencimento, parcela_atual, total_parcelas):
+    vencimento_base = datetime.strptime(data_vencimento, '%Y-%m-%d')
+    nota_limpa = (numero_nota or 'S/N').strip()
+    dist_limpa = distribuidora.strip()
+    emissao_limpa = data_emissao.strip() if data_emissao else datetime.now().strftime('%Y-%m-%d')
+
+    if parcela_atual > total_parcelas:
+        raise ValueError("A parcela atual não pode ser maior que o total de parcelas.")
+
+    with obter_conexao() as conexao:
+        cursor = conexao.cursor()
+        for i in range(parcela_atual, total_parcelas + 1):
+            salto_meses = i - parcela_atual
+            novo_vencimento = calcular_novo_mes(vencimento_base, salto_meses)
+            
+            cursor.execute('''
+                INSERT INTO boletos (
+                    distribuidora, numero_nota, valor_parcela, data_emissao, 
+                    data_vencimento, parcela_atual, total_parcelas, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Aberto')
+            ''', (dist_limpa, nota_limpa, float(valor), emissao_limpa, novo_vencimento, i, total_parcelas))
+            
+    print(f"[Banco] Lote {nota_limpa} ({dist_limpa}) cadastrado: {total_parcelas - parcela_atual + 1} parcelas salvas.")
+
+def listar_boletos():
+    with obter_conexao() as conexao:
+        cursor = conexao.cursor()
+        cursor.execute("SELECT id, distribuidora, numero_nota, valor_parcela, data_emissao, data_vencimento, parcela_atual, total_parcelas, status FROM boletos ORDER BY data_vencimento ASC")
+        return [dict(linha) for linha in cursor.fetchall()]
+
+
+============================================================
+CAMINHO DO FICHEIRO: backend\main.py
+============================================================
+
+import io
+import csv
+from datetime import datetime, timedelta
+from typing import Optional, List
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+import backend.database as db
+import backend.utils_backup as backup
+from backend.config import obter_diretorio_recursos
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    TEM_OPENPYXL = True
+except ImportError:
+    TEM_OPENPYXL = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicialização do banco e verificação de backup
+    db.criar_tabelas()
+    backup.fazer_backup_banco()
+    yield
+
+app = FastAPI(title="AutoVision - Gestão de Boletos API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class BoletoCreate(BaseModel):
+    distribuidora: str = Field(..., min_length=1)
+    numero_nota: Optional[str] = "S/N"
+    valor_parcela: float = Field(..., gt=0)
+    data_emissao: Optional[str] = None
+    # Substituído regex por pattern (compatibilidade Pydantic v2)
+    data_vencimento: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    parcela_atual: int = Field(1, ge=1)
+    total_parcelas: int = Field(1, ge=1)
+
+class ParcelaRestaurar(BaseModel):
+    id: int
+    status_anterior: str
+
+class ExcluirLotePayload(BaseModel):
+    ids: List[int]
+
+class RestaurarLotePayload(BaseModel):
+    parcelas: List[ParcelaRestaurar]
+
+@app.get("/status")
+def home():
+    return {"status": "AutoVision online!"}
+
+def formatar_data_br(data_iso: str) -> str:
+    if not data_iso or len(data_iso) != 10:
+        return data_iso or ""
+    p = data_iso.split('-')
+    return f"{p[2]}/{p[1]}/{p[0]}"
+
+@app.get("/boletos")
+def obter_boletos(
+    distribuidora: Optional[str] = Query(None),
+    dias_vencimento: Optional[int] = Query(None),
+    status: Optional[str] = Query("Aberto")
+):
+    boletos_raw = db.listar_boletos()
+    boletos_ativos = [b for b in boletos_raw if b["status"] != 'Excluido']
+
+    # Mapa para consolidar o resumo completo de cada compra
+    mapa_compras = {}
+    for b in boletos_ativos:
+        dist = (b["distribuidora"] or '').strip().upper()
+        nota = (b["numero_nota"] or 'S/N').strip().upper()
+        emissao = b["data_emissao"] or b["data_vencimento"]
+        venc = b["data_vencimento"]
+        valor = float(b["valor_parcela"])
+        st = b["status"]
+        chave = f"{dist}__{nota}__{b['data_emissao'] or 'SEM_EMISSAO'}"
+
+        if chave not in mapa_compras:
+            mapa_compras[chave] = {
+                "inicio": emissao,
+                "termino": venc,
+                "total_parcelas": b["total_parcelas"],
+                "valor_total": 0.0,
+                "total_pago": 0.0,
+                "total_pendente": 0.0,
+                "qtd_pagas": 0,
+                "todos_ids": [],
+                "todas_parcelas_info": []
+            }
+        
+        info = mapa_compras[chave]
+        info["todos_ids"].append(b["id"])
+        info["todas_parcelas_info"].append({"id": b["id"], "status_anterior": b["status"]})
+
+        if venc > info["termino"]:
+            info["termino"] = venc
+        if emissao < info["inicio"]:
+            info["inicio"] = emissao
+            
+        info["valor_total"] += valor
+        if st == 'Pago':
+            info["total_pago"] += valor
+            info["qtd_pagas"] += 1
+        else:
+            info["total_pendente"] += valor
+
+    boletos_formatados = []
+    hoje = datetime.now().date()
+    data_limite = hoje + timedelta(days=dias_vencimento) if dias_vencimento is not None else None
+
+    for b in boletos_ativos:
+        dist = (b["distribuidora"] or '').strip().upper()
+        nota = (b["numero_nota"] or 'S/N').strip().upper()
+        chave = f"{dist}__{nota}__{b['data_emissao'] or 'SEM_EMISSAO'}"
+        dados_compra = mapa_compras.get(chave)
+
+        item = {
+            "id": b["id"],
+            "distribuidora": b["distribuidora"],
+            "numero_nota": b["numero_nota"] or 'S/N',
+            "valor_parcela": b["valor_parcela"],
+            "data_emissao": b["data_emissao"],
+            "data_vencimento": b["data_vencimento"],
+            "parcela_atual": b["parcela_atual"],
+            "total_parcelas": b["total_parcelas"],
+            "status": b["status"],
+            "compra_chave": chave,
+            "compra_resumo": {
+                "data_inicio": dados_compra["inicio"] if dados_compra else b["data_vencimento"],
+                "data_termino": dados_compra["termino"] if dados_compra else b["data_vencimento"],
+                "total_parcelas": dados_compra["total_parcelas"] if dados_compra else b["total_parcelas"],
+                "qtd_pagas": dados_compra["qtd_pagas"] if dados_compra else 0,
+                "valor_total": round(dados_compra["valor_total"], 2) if dados_compra else round(b["valor_parcela"] * b["total_parcelas"], 2),
+                "total_pago": round(dados_compra["total_pago"], 2) if dados_compra else 0.0,
+                "total_pendente": round(dados_compra["total_pendente"], 2) if dados_compra else round(b["valor_parcela"], 2),
+                "todos_ids_compra": dados_compra["todos_ids"] if dados_compra else [b["id"]],
+                "todas_parcelas_info": dados_compra["todas_parcelas_info"] if dados_compra else [{"id": b["id"], "status_anterior": b["status"]}]
+            }
+        }
+        
+        if status and status.lower() != 'todos':
+            if item["status"].lower() != status.lower():
+                continue
+
+        if distribuidora and distribuidora.strip():
+            if distribuidora.strip().lower() not in item["distribuidora"].lower():
+                continue
+
+        if dias_vencimento is not None:
+            try:
+                data_venc = datetime.strptime(item["data_vencimento"], '%Y-%m-%d').date()
+                if not (data_venc <= data_limite):
+                    continue
+            except ValueError:
+                continue
+
+        boletos_formatados.append(item)
+        
+    return boletos_formatados
+
+@app.post("/boletos")
+def criar_boleto(novo_boleto: BoletoCreate):
+    if novo_boleto.parcela_atual > novo_boleto.total_parcelas:
+        raise HTTPException(status_code=400, detail="A parcela inicial não pode ser superior ao total de parcelas.")
+
+    db.cadastrar_boleto(
+        novo_boleto.distribuidora, 
+        novo_boleto.numero_nota, 
+        novo_boleto.valor_parcela, 
+        novo_boleto.data_emissao, 
+        novo_boleto.data_vencimento, 
+        novo_boleto.parcela_atual, 
+        novo_boleto.total_parcelas
+    )
+    return {"mensagem": "Boleto e parcelas projetadas salvos com sucesso!"}
+
+@app.put("/boletos/{boleto_id}/pagar")
+def marcar_como_pago(boleto_id: int):
+    with db.obter_conexao() as conexao:
+        cursor = conexao.cursor()
+        cursor.execute("UPDATE boletos SET status = 'Pago' WHERE id = ?", (boleto_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Boleto não encontrado.")
+    return {"mensagem": f"Boleto ID {boleto_id} marcado como Pago!"}
+
+@app.post("/compras/excluir")
+def excluir_compra(dados: ExcluirLotePayload):
+    if not dados.ids:
+        raise HTTPException(status_code=400, detail="Nenhum boleto informado para exclusão.")
+    
+    placeholders = ','.join(['?'] * len(dados.ids))
+    with db.obter_conexao() as conexao:
+        cursor = conexao.cursor()
+        cursor.execute(f"UPDATE boletos SET status = 'Excluido' WHERE id IN ({placeholders})", dados.ids)
+    return {"mensagem": "Compra excluída com sucesso!"}
+
+@app.post("/compras/restaurar")
+def restaurar_compra(dados: RestaurarLotePayload):
+    if not dados.parcelas:
+        raise HTTPException(status_code=400, detail="Nenhuma parcela informada para restauração.")
+
+    with db.obter_conexao() as conexao:
+        cursor = conexao.cursor()
+        for p in dados.parcelas:
+            cursor.execute("UPDATE boletos SET status = ? WHERE id = ?", (p.status_anterior, p.id))
+    return {"mensagem": "Compra restaurada com sucesso!"}
+
+@app.get("/boletos/exportar/excel")
+def exportar_excel(
+    distribuidora: Optional[str] = Query(None),
+    dias_vencimento: Optional[int] = Query(None),
+    status: Optional[str] = Query("Aberto")
+):
+    boletos = obter_boletos(distribuidora=distribuidora, dias_vencimento=dias_vencimento, status=status)
+    if not boletos:
+        raise HTTPException(status_code=404, detail="Nenhum dado encontrado para exportar.")
+
+    if TEM_OPENPYXL:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "AutoVision Painel"
+        ws.views.sheetView[0].showGridLines = True
+
+        c_azul_profundo = "0B1329"
+        c_azul_card = "0F172A"
+        c_azul_cabecalho = "1E293B"
+        c_ciano = "00D2FF"
+        c_esmeralda = "10B981"
+        c_branco = "F8FAFC"
+        c_cinza_texto = "94A3B8"
+        c_borda_card = "334155"
+
+        fonte_titulo = Font(name="Segoe UI", size=15, bold=True, color=c_ciano)
+        fonte_subtitulo = Font(name="Segoe UI", size=9, italic=True, color=c_cinza_texto)
+        fonte_kpi_rotulo = Font(name="Segoe UI", size=9, bold=True, color=c_cinza_texto)
+        fonte_kpi_valor_ciano = Font(name="Segoe UI", size=14, bold=True, color=c_ciano)
+        fonte_kpi_valor_esmeralda = Font(name="Segoe UI", size=14, bold=True, color=c_esmeralda)
+        fonte_kpi_valor_branco = Font(name="Segoe UI", size=14, bold=True, color=c_branco)
+        
+        fonte_cabecalho = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+        fonte_dado = Font(name="Segoe UI", size=10)
+        fonte_total = Font(name="Segoe UI", size=11, bold=True, color=c_azul_profundo)
+
+        fill_titulo = PatternFill(start_color=c_azul_profundo, end_color=c_azul_profundo, fill_type="solid")
+        fill_card = PatternFill(start_color=c_azul_card, end_color=c_azul_card, fill_type="solid")
+        fill_cabecalho = PatternFill(start_color=c_azul_cabecalho, end_color=c_azul_cabecalho, fill_type="solid")
+        fill_zebra = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+        fill_pago = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
+        fill_aberto = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+
+        borda_fina = Border(
+            left=Side(style='thin', color='CBD5E1'),
+            right=Side(style='thin', color='CBD5E1'),
+            top=Side(style='thin', color='CBD5E1'),
+            bottom=Side(style='thin', color='CBD5E1')
+        )
+        borda_card = Border(
+            left=Side(style='thin', color=c_borda_card),
+            right=Side(style='thin', color=c_borda_card),
+            top=Side(style='thin', color=c_borda_card),
+            bottom=Side(style='thin', color=c_borda_card)
+        )
+        borda_dupla_total = Border(
+            top=Side(style='thin', color='000000'),
+            bottom=Side(style='double', color='000000')
+        )
+
+        ws.merge_cells("A1:I1")
+        cell_t = ws["A1"]
+        cell_t.value = "⚡ AUTOVISION - PAINEL FINANCEIRO DE BOLETOS & COMPRAS"
+        cell_t.font = fonte_titulo
+        cell_t.fill = fill_titulo
+        cell_t.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 36
+
+        ws.merge_cells("A2:I2")
+        ws["A2"].value = f"Relatório Gerado em: {datetime.now().strftime('%d/%m/%Y às %H:%M')} | Filtro Aplicado: Status {status or 'Todos'}"
+        ws["A2"].font = fonte_subtitulo
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[2].height = 18
+
+        ws.row_dimensions[3].height = 6
+        ws.row_dimensions[4].height = 16
+        ws.row_dimensions[5].height = 24
+
+        linha_inicio_dados = 8
+        linha_fim_dados = linha_inicio_dados + len(boletos) - 1
+
+        ws.merge_cells("A4:C4")
+        ws["A4"].value = "💳 TOTAL EM ABERTO (PENDENTE)"
+        ws["A4"].font = fonte_kpi_rotulo
+        ws["A4"].alignment = Alignment(horizontal="center", vertical="center")
+        
+        ws.merge_cells("A5:C5")
+        ws["A5"].value = f'=SUMIF(I{linha_inicio_dados}:I{linha_fim_dados}, "ABERTO", G{linha_inicio_dados}:G{linha_fim_dados})'
+        ws["A5"].font = fonte_kpi_valor_ciano
+        ws["A5"].number_format = '"R$" #,##0.00'
+        ws["A5"].alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.merge_cells("D4:F4")
+        ws["D4"].value = "🏁 TOTAL JÁ QUITADO"
+        ws["D4"].font = fonte_kpi_rotulo
+        ws["D4"].alignment = Alignment(horizontal="center", vertical="center")
+        
+        ws.merge_cells("D5:F5")
+        ws["D5"].value = f'=SUMIF(I{linha_inicio_dados}:I{linha_fim_dados}, "PAGO", G{linha_inicio_dados}:G{linha_fim_dados})'
+        ws["D5"].font = fonte_kpi_valor_esmeralda
+        ws["D5"].number_format = '"R$" #,##0.00'
+        ws["D5"].alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.merge_cells("G4:I4")
+        ws["G4"].value = "📦 VOLUME DE PARCELAS LISTADAS"
+        ws["G4"].font = fonte_kpi_rotulo
+        ws["G4"].alignment = Alignment(horizontal="center", vertical="center")
+        
+        ws.merge_cells("G5:I5")
+        ws["G5"].value = f'=COUNTA(A{linha_inicio_dados}:A{linha_fim_dados})'
+        ws["G5"].font = fonte_kpi_valor_branco
+        ws["G5"].alignment = Alignment(horizontal="center", vertical="center")
+
+        for col_idx in range(1, 10):
+            c4 = ws.cell(row=4, column=col_idx)
+            c5 = ws.cell(row=5, column=col_idx)
+            c4.fill = fill_card
+            c5.fill = fill_card
+            c4.border = borda_card
+            c5.border = borda_card
+
+        ws.row_dimensions[6].height = 10
+
+        cabecalhos = [
+            'Distribuidora', 'Nº Nota', 'Início Compra', 'Parcela', 
+            'Vencimento', 'Término Compra', 'Valor Parcela', 'Total Compra', 'Status'
+        ]
+        
+        ws.row_dimensions[7].height = 28
+        for col_idx, cabecalho in enumerate(cabecalhos, start=1):
+            cell = ws.cell(row=7, column=col_idx, value=cabecalho)
+            cell.font = fonte_cabecalho
+            cell.fill = fill_cabecalho
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = borda_fina
+
+        ws.auto_filter.ref = f"A7:I{linha_fim_dados}"
+        ws.freeze_panes = "A8"
+
+        linha_atual = linha_inicio_dados
+        for idx, b in enumerate(boletos):
+            ws.row_dimensions[linha_atual].height = 21
+            resumo = b['compra_resumo']
+            
+            ws.cell(row=linha_atual, column=1, value=b['distribuidora'])
+            ws.cell(row=linha_atual, column=2, value=b['numero_nota'])
+            ws.cell(row=linha_atual, column=3, value=formatar_data_br(resumo['data_inicio']))
+            ws.cell(row=linha_atual, column=4, value=f"{b['parcela_atual']} de {b['total_parcelas']}")
+            ws.cell(row=linha_atual, column=5, value=formatar_data_br(b['data_vencimento']))
+            ws.cell(row=linha_atual, column=6, value=formatar_data_br(resumo['data_termino']))
+            
+            c_val = ws.cell(row=linha_atual, column=7, value=b['valor_parcela'])
+            c_val.number_format = '"R$" #,##0.00'
+
+            c_tot = ws.cell(row=linha_atual, column=8, value=resumo['valor_total'])
+            c_tot.number_format = '"R$" #,##0.00'
+
+            st_limpo = "PAGO" if b['status'] == 'Pago' else "ABERTO"
+            c_status = ws.cell(row=linha_atual, column=9, value=st_limpo)
+
+            for col_i in range(1, 10):
+                celula = ws.cell(row=linha_atual, column=col_i)
+                celula.font = fonte_dado
+                celula.border = borda_fina
+                if idx % 2 == 1:
+                    celula.fill = fill_zebra
+
+            ws.cell(row=linha_atual, column=1).alignment = Alignment(horizontal="left", vertical="center")
+            ws.cell(row=linha_atual, column=2).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=linha_atual, column=3).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=linha_atual, column=4).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=linha_atual, column=5).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(row=linha_atual, column=6).alignment = Alignment(horizontal="center", vertical="center")
+            c_val.alignment = Alignment(horizontal="right", vertical="center")
+            c_tot.alignment = Alignment(horizontal="right", vertical="center")
+            c_status.alignment = Alignment(horizontal="center", vertical="center")
+
+            if st_limpo == 'PAGO':
+                c_status.fill = fill_pago
+                c_status.font = Font(name="Segoe UI", size=10, bold=True, color="166534")
+            else:
+                c_status.fill = fill_aberto
+                c_status.font = Font(name="Segoe UI", size=10, bold=True, color="991B1B")
+
+            linha_atual += 1
+
+        # Linha de totalização correta (somente da coluna de parcelas)
+        ws.row_dimensions[linha_atual].height = 26
+        ws.merge_cells(start_row=linha_atual, start_column=1, end_row=linha_atual, end_column=6)
+        
+        c_rotulo_total = ws.cell(row=linha_atual, column=1)
+        c_rotulo_total.value = "TOTAL DAS PARCELAS (RECALCULA CONFORME OS FILTROS):"
+        c_rotulo_total.font = fonte_total
+        c_rotulo_total.alignment = Alignment(horizontal="right", vertical="center")
+
+        c_subtotal_val = ws.cell(row=linha_atual, column=7)
+        c_subtotal_val.value = f"=SUBTOTAL(109, G{linha_inicio_dados}:G{linha_fim_dados})"
+        c_subtotal_val.font = Font(name="Segoe UI", size=11, bold=True, color="0070F3")
+        c_subtotal_val.number_format = '"R$" #,##0.00'
+        c_subtotal_val.alignment = Alignment(horizontal="right", vertical="center")
+
+        c_vazio_h = ws.cell(row=linha_atual, column=8, value="-")
+        c_vazio_h.alignment = Alignment(horizontal="center", vertical="center")
+
+        for col_i in range(1, 10):
+            ws.cell(row=linha_atual, column=col_i).border = borda_dupla_total
+
+        # Auto-ajuste de colunas ignorando a linha de totais mesclada
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                if cell.row in [1, 2, 4, 5, linha_atual]:
+                    continue
+                if cell.value is not None:
+                    max_len = max(max_len, len(str(cell.value)))
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
+
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        headers = {
+            'Content-Disposition': 'attachment; filename="AutoVision_Relatorio_Boletos.xlsx"',
+            'Access-Control-Expose-Headers': 'Content-Disposition'
+        }
+        return StreamingResponse(buffer, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=';')
+    writer.writerow(['Distribuidora', 'Nº Nota', 'Início Compra', 'Parcela', 'Vencimento', 'Término Compra', 'Valor Parcela (R$)', 'Total Compra (R$)', 'Status'])
+    for b in boletos:
+        resumo = b['compra_resumo']
+        writer.writerow([
+            b['distribuidora'], b['numero_nota'], formatar_data_br(resumo['data_inicio']),
+            f"{b['parcela_atual']}/{b['total_parcelas']}", formatar_data_br(b['data_vencimento']),
+            formatar_data_br(resumo['data_termino']),
+            f"{b['valor_parcela']:.2f}".replace('.', ','),
+            f"{resumo['valor_total']:.2f}".replace('.', ','),
+            b['status']
+        ])
+    
+    bytes_buffer = io.BytesIO(buffer.getvalue().encode('utf-8-sig'))
+    headers = {
+        'Content-Disposition': 'attachment; filename="AutoVision_Relatorio_Boletos.csv"',
+        'Access-Control-Expose-Headers': 'Content-Disposition'
+    }
+    return StreamingResponse(bytes_buffer, media_type="text/csv", headers=headers)
+
+caminho_dist = obter_diretorio_recursos() / "frontend" / "dist"
+if caminho_dist.exists():
+    app.mount("/", StaticFiles(directory=str(caminho_dist), html=True), name="frontend")
+
+
+============================================================
+CAMINHO DO FICHEIRO: backend\utils_backup.py
+============================================================
+
+import sqlite3
+from datetime import datetime
+from backend.config import CAMINHO_BANCO, PASTA_BACKUPS
+
+def fazer_backup_banco():
+    """
+    Realiza backup a quente e consistente utilizando a API oficial de backup do SQLite,
+    evitando corrupção de páginas e compatível com modo WAL.
+    """
+    if not CAMINHO_BANCO.exists():
+        return
+
+    PASTA_BACKUPS.mkdir(parents=True, exist_ok=True)
+
+    data_hoje = datetime.now().strftime('%Y%m%d')
+    nome_backup = f"oficina_{data_hoje}.db.bak"
+    caminho_destino = PASTA_BACKUPS / nome_backup
+
+    if caminho_destino.exists():
+        try:
+            mtime_banco = CAMINHO_BANCO.stat().st_mtime
+            mtime_backup = caminho_destino.stat().st_mtime
+            if mtime_banco <= mtime_backup:
+                return
+        except Exception:
+            pass
+
+    try:
+        # Backup online atômico e transacional nativo do SQLite
+        with sqlite3.connect(str(CAMINHO_BANCO)) as src:
+            with sqlite3.connect(str(caminho_destino)) as dst:
+                src.backup(dst)
+        
+        print(f"[Segurança] Backup diário registrado com sucesso: {nome_backup}")
+
+        # Retenção: Mantém os 20 backups mais recentes
+        backups = sorted(PASTA_BACKUPS.glob("oficina_*.db.bak"), key=lambda p: p.stat().st_mtime)
+        while len(backups) > 20:
+            antigo = backups.pop(0)
+            try:
+                antigo.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Erro de Segurança] Falha ao criar backup: {e}")
+
+
+============================================================
+CAMINHO DO FICHEIRO: frontend/src\App.vue
+============================================================
+
+<script setup>
+import { ref, onMounted, onUnmounted, computed } from 'vue'
+import GraficoMensal from './components/GraficoMensal.vue'
+
+const abaAtual = ref('dashboard')
+const modoVisualizacao = ref('compras')
+const comprasExpandidas = ref({})
+const formularioAberto = ref(false)
+
+const boletosDashboard = ref([])
+const boletosGestao = ref([])
+const erroDeConexao = ref(null)
+
+// ESTADO DO TOAST DE DESFAZER
+const toastUndo = ref({
+  visivel: false,
+  mensagem: '',
+  dadosBackup: null,
+  tempoRestante: 15,
+  intervaloId: null
+})
+
+const filtroDistribuidora = ref('')
+const filtroDiasVencimento = ref(null)
+const filtroStatus = ref('Aberto')
+
+let debounceBuscaTimeout = null
+
+const obterDataHojeIso = () => new Date().toISOString().split('T')[0]
+
+const novoBoleto = ref({
+  distribuidora: '',
+  numero_nota: '',
+  valor_parcela: null,
+  data_emissao: obterDataHojeIso(),
+  data_vencimento: '',
+  parcela_atual: 1,
+  total_parcelas: 1
+})
+
+const obterApiUrl = (endpoint) => {
+  const isDev = import.meta.env.DEV
+  const base = isDev ? 'http://127.0.0.1:9000' : ''
+  return `${base}${endpoint}`
+}
+
+const formatarDataBR = (dataIso) => {
+  if (!dataIso) return ''
+  const partes = dataIso.split('-')
+  if (partes.length !== 3) return dataIso
+  return `${partes[2]}/${partes[1]}/${partes[0]}`
+}
+
+const formatarMoeda = (val) => {
+  return Number(val || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+}
+
+const alternarExpansao = (chave) => {
+  comprasExpandidas.value[chave] = !comprasExpandidas.value[chave]
+}
+
+const carregarDashboard = async () => {
+  try {
+    const res = await fetch(obterApiUrl('/boletos?status=Todos'))
+    if (!res.ok) throw new Error('Falha ao carregar dashboard.')
+    boletosDashboard.value = await res.json()
+  } catch (erro) {
+    erroDeConexao.value = erro.message
+  }
+}
+
+const carregarGestao = async () => {
+  try {
+    let url = `/boletos?status=${filtroStatus.value}&`
+    if (filtroDistribuidora.value.trim()) url += `distribuidora=${encodeURIComponent(filtroDistribuidora.value.trim())}&`
+    if (filtroDiasVencimento.value !== null && filtroDiasVencimento.value !== '') url += `dias_vencimento=${filtroDiasVencimento.value}&`
+
+    const res = await fetch(obterApiUrl(url))
+    if (!res.ok) throw new Error('Falha ao buscar dados.')
+    boletosGestao.value = await res.json()
+  } catch (erro) {
+    erroDeConexao.value = erro.message
+  }
+}
+
+const aplicarFiltroComDebounce = () => {
+  clearTimeout(debounceBuscaTimeout)
+  debounceBuscaTimeout = setTimeout(() => {
+    carregarGestao()
+  }, 250)
+}
+
+const recarregarTudo = async () => {
+  erroDeConexao.value = null
+  await Promise.all([carregarDashboard(), carregarGestao()])
+}
+
+const salvarBoleto = async () => {
+  if (novoBoleto.value.parcela_atual > novoBoleto.value.total_parcelas) {
+    alert('Erro: A parcela inicial não pode ser superior ao total de parcelas.')
+    return
+  }
+
+  if (novoBoleto.value.valor_parcela <= 0) {
+    alert('Erro: O valor da parcela deve ser maior que zero.')
+    return
+  }
+
+  try {
+    const res = await fetch(obterApiUrl('/boletos'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(novoBoleto.value)
+    })
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}))
+      throw new Error(errData.detail || 'Falha ao salvar compra.')
+    }
+    
+    await recarregarTudo()
+    alert('Compra cadastrada e parcelas projetadas com sucesso!')
+    
+    novoBoleto.value.distribuidora = ''
+    novoBoleto.value.numero_nota = ''
+    novoBoleto.value.valor_parcela = null
+    novoBoleto.value.data_vencimento = ''
+    novoBoleto.value.data_emissao = obterDataHojeIso()
+    novoBoleto.value.parcela_atual = 1
+    novoBoleto.value.total_parcelas = 1
+    formularioAberto.value = false
+    abaAtual.value = 'gestao'
+  } catch (erro) {
+    alert("Erro ao salvar: " + erro.message)
+  }
+}
+
+const marcarComoPago = async (id) => {
+  if (!confirm("Confirmar a quitação desta parcela?")) return
+  try {
+    const res = await fetch(obterApiUrl(`/boletos/${id}/pagar`), { method: 'PUT' })
+    if (!res.ok) throw new Error('Falha ao atualizar status.')
+    await recarregarTudo()
+  } catch (erro) {
+    alert("Erro ao quitar: " + erro.message)
+  }
+}
+
+// ========================================================
+// EXCLUSÃO COMPLETA E SEGURA DE TODAS AS PARCELAS DA COMPRA
+// ========================================================
+const apagarCompra = async (compra) => {
+  const confirmou = confirm(
+    `Tem certeza que deseja apagar a compra "${compra.distribuidora}" (NF: ${compra.numero_nota}) com todas as ${compra.total_parcelas} parcelas registradas?`
+  )
+  if (!confirmou) return
+
+  try {
+    // Captura os IDs e status de TODAS as parcelas reais da compra
+    const idsParaExcluir = compra.todos_ids
+    const parcelasBackup = compra.todas_parcelas_info
+
+    const res = await fetch(obterApiUrl('/compras/excluir'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: idsParaExcluir })
+    })
+
+    if (!res.ok) throw new Error('Falha ao excluir compra.')
+
+    await recarregarTudo()
+
+    if (toastUndo.value.intervaloId) clearInterval(toastUndo.value.intervaloId)
+
+    toastUndo.value.visivel = true
+    toastUndo.value.mensagem = `Compra "${compra.distribuidora}" (NF: ${compra.numero_nota}) excluída.`
+    toastUndo.value.dadosBackup = parcelasBackup
+    toastUndo.value.tempoRestante = 15
+
+    toastUndo.value.intervaloId = setInterval(() => {
+      toastUndo.value.tempoRestante--
+      if (toastUndo.value.tempoRestante <= 0) {
+        fecharToast()
+      }
+    }, 1000)
+
+  } catch (erro) {
+    alert("Erro ao excluir: " + erro.message)
+  }
+}
+
+const desfazerExclusao = async () => {
+  if (!toastUndo.value.dadosBackup) return
+
+  try {
+    const res = await fetch(obterApiUrl('/compras/restaurar'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parcelas: toastUndo.value.dadosBackup })
+    })
+
+    if (!res.ok) throw new Error('Falha ao restaurar compra.')
+
+    fecharToast()
+    await recarregarTudo()
+  } catch (erro) {
+    alert("Erro ao desfazer exclusão: " + erro.message)
+  }
+}
+
+const fecharToast = () => {
+  if (toastUndo.value.intervaloId) clearInterval(toastUndo.value.intervaloId)
+  toastUndo.value.visivel = false
+  toastUndo.value.dadosBackup = null
+}
+
+const exportarExcel = () => {
+  let url = `/boletos/exportar/excel?status=${filtroStatus.value}&`
+  if (filtroDistribuidora.value.trim()) url += `distribuidora=${encodeURIComponent(filtroDistribuidora.value.trim())}&`
+  if (filtroDiasVencimento.value) url += `dias_vencimento=${filtroDiasVencimento.value}&`
+  window.open(obterApiUrl(url), '_blank')
+}
+
+const comprasAgrupadas = computed(() => {
+  const grupos = {}
+
+  boletosGestao.value.forEach(b => {
+    const chave = b.compra_chave
+    const resumo = b.compra_resumo
+
+    if (!grupos[chave]) {
+      grupos[chave] = {
+        chave,
+        distribuidora: b.distribuidora,
+        numero_nota: b.numero_nota,
+        data_inicio: resumo.data_inicio,
+        data_termino: resumo.data_termino,
+        total_parcelas: resumo.total_parcelas,
+        qtd_pagas: resumo.qtd_pagas,
+        valor_total: resumo.valor_total,
+        total_pago: resumo.total_pago,
+        total_pendente: resumo.total_pendente,
+        todos_ids: resumo.todos_ids_compra,
+        todas_parcelas_info: resumo.todas_parcelas_info,
+        parcelas: []
+      }
+    }
+    grupos[chave].parcelas.push(b)
+  })
+
+  // Ordena parcelas internas numericamente
+  Object.values(grupos).forEach(grupo => {
+    grupo.parcelas.sort((a, b) => a.parcela_atual - b.parcela_atual)
+  })
+
+  // Ordena compras cronologicamente
+  return Object.values(grupos).sort((a, b) => a.data_inicio.localeCompare(b.data_inicio))
+})
+
+const totalPendenteGeral = computed(() => {
+  return boletosDashboard.value.reduce((acc, b) => b.status !== 'Pago' ? acc + b.valor_parcela : acc, 0)
+})
+
+const totalPagoGeral = computed(() => {
+  return boletosDashboard.value.reduce((acc, b) => b.status === 'Pago' ? acc + b.valor_parcela : acc, 0)
+})
+
+const parcelasPendentesQtd = computed(() => {
+  return boletosDashboard.value.filter(b => b.status !== 'Pago').length
+})
+
+const limparFiltros = () => {
+  filtroDistribuidora.value = ''
+  filtroDiasVencimento.value = null
+  filtroStatus.value = 'Aberto'
+  carregarGestao()
+}
+
+onMounted(() => recarregarTudo())
+
+onUnmounted(() => {
+  if (toastUndo.value.intervaloId) clearInterval(toastUndo.value.intervaloId)
+  clearTimeout(debounceBuscaTimeout)
+})
+</script>
+
+<template>
+  <div class="layout-app">
+    <!-- HEADER -->
+    <header class="header-principal">
+      <div class="marca-app">
+        <img src="/logo.png" alt="AutoVision Logo" class="icone-logo" />
+        <div>
+          <div class="linha-marca">
+            <h1 class="titulo-app">Auto<span class="destaque-vision">Vision</span></h1>
+            <span class="badge-versao">v1.0 PRO</span>
+          </div>
+          <span class="subtitulo-app">Gestão Inteligente de Boletos & Fornecedores</span>
+        </div>
+      </div>
+
+      <nav class="nav-segmentada">
+        <button 
+          @click="abaAtual = 'dashboard'" 
+          :class="['btn-aba', { 'btn-aba-ativa': abaAtual === 'dashboard' }]"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
+          </svg>
+          Dashboard
+        </button>
+        <button 
+          @click="abaAtual = 'gestao'" 
+          :class="['btn-aba', { 'btn-aba-ativa': abaAtual === 'gestao' }]"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="12" y1="18" x2="12" y2="12"/>
+            <line x1="9" y1="15" x2="15" y2="15"/>
+          </svg>
+          Gestão & Compras
+        </button>
+      </nav>
+    </header>
+
+    <main class="conteudo-principal">
+
+      <!-- ABA 1: DASHBOARD -->
+      <section v-if="abaAtual === 'dashboard'">
+        <div class="banner-hero">
+          <div class="info-hero">
+            <h2 class="titulo-hero">Visão Geral da Oficina</h2>
+            <p class="desc-hero">Monitore contas pendentes, controle prazos de distribuidoras e evite juros.</p>
+          </div>
+          <button @click="exportarExcel" class="btn-excel-topo">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Baixar Relatório (.XLSX)
+          </button>
+        </div>
+
+        <div class="grid-kpis">
+          <div class="card-kpi glow-ciano">
+            <div class="kpi-icone icone-ciano">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </div>
+            <div>
+              <span class="kpi-rotulo">Total a Pagar (Pendente)</span>
+              <div class="kpi-valor valor-ciano">{{ formatarMoeda(totalPendenteGeral) }}</div>
+            </div>
+          </div>
+
+          <div class="card-kpi glow-esmeralda">
+            <div class="kpi-icone icone-esmeralda">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+            </div>
+            <div>
+              <span class="kpi-rotulo">Total Já Quitado</span>
+              <div class="kpi-valor valor-esmeralda">{{ formatarMoeda(totalPagoGeral) }}</div>
+            </div>
+          </div>
+
+          <div class="card-kpi glow-indigo">
+            <div class="kpi-icone icone-indigo">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+              </svg>
+            </div>
+            <div>
+              <span class="kpi-rotulo">Boletos em Aberto</span>
+              <div class="kpi-valor valor-indigo">{{ parcelasPendentesQtd }} <span style="font-size: 15px; font-weight: normal; color: #94a3b8;">parcelas</span></div>
+            </div>
+          </div>
+        </div>
+
+        <GraficoMensal :boletos="boletosDashboard" />
+      </section>
+
+      <!-- ABA 2: GESTÃO E COMPRAS -->
+      <section v-if="abaAtual === 'gestao'">
+        <div class="barra-topo-gestao">
+          <div>
+            <h3 style="font-size: 18px; font-weight: 700; color: #f8fafc; margin: 0;">Gestão Financeira de Compras</h3>
+            <p style="font-size: 13px; color: #94a3b8; margin: 2px 0 0 0;">Controle agrupado por fornecedor com projeção de vencimentos</p>
+          </div>
+          
+          <button 
+            @click="formularioAberto = !formularioAberto" 
+            :class="['btn-toggle-novo', { 'btn-toggle-ativo': formularioAberto }]"
+          >
+            <span v-if="!formularioAberto">➕ Nova Compra</span>
+            <span v-else>✖ Fechar Formulário</span>
+          </button>
+        </div>
+
+        <!-- FORMULÁRIO -->
+        <div v-if="formularioAberto" class="card-cockpit painel-animado">
+          <div class="card-topo-titulo">
+            <div class="circulo-icone icone-ciano">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </div>
+            <div>
+              <h3 style="font-size: 16px; font-weight: 700; color: #f8fafc;">Cadastrar Nova Compra</h3>
+              <p style="font-size: 12px; color: #94a3b8;">Insira os dados da nota para projetar as parcelas mensais</p>
+            </div>
+          </div>
+
+          <form @submit.prevent="salvarBoleto" class="grid-formulario">
+            <div class="campo-grupo">
+              <label class="rotulo">Distribuidora:</label>
+              <input v-model="novoBoleto.distribuidora" required type="text" placeholder="Ex: Bosch, Nakata, Tecfil" class="input-cockpit">
+            </div>
+
+            <div class="campo-grupo">
+              <label class="rotulo">Nº da Nota:</label>
+              <input v-model="novoBoleto.numero_nota" type="text" placeholder="Ex: NF-1234" class="input-cockpit">
+            </div>
+
+            <div class="campo-grupo">
+              <label class="rotulo">Valor da Parcela (R$):</label>
+              <input v-model.number="novoBoleto.valor_parcela" required type="number" step="0.01" min="0.01" placeholder="0,00" class="input-cockpit">
+            </div>
+
+            <div class="campo-grupo">
+              <label class="rotulo">Data de Emissão:</label>
+              <input v-model="novoBoleto.data_emissao" required type="date" class="input-cockpit">
+            </div>
+
+            <div class="campo-grupo">
+              <label class="rotulo">1º Vencimento:</label>
+              <input v-model="novoBoleto.data_vencimento" required type="date" class="input-cockpit">
+            </div>
+
+            <div class="campo-grupo">
+              <label class="rotulo">Parcela Inicial:</label>
+              <input v-model.number="novoBoleto.parcela_atual" required type="number" min="1" class="input-cockpit">
+            </div>
+
+            <div class="campo-grupo">
+              <label class="rotulo">Total de Parcelas:</label>
+              <input v-model.number="novoBoleto.total_parcelas" required type="number" :min="novoBoleto.parcela_atual || 1" class="input-cockpit">
+            </div>
+
+            <div class="area-submit">
+              <button type="submit" class="btn-gradiente-acao">
+                Salvar Compra e Projetar Parcelas
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <!-- FILTROS -->
+        <div class="card-cockpit" style="padding: 16px 20px; margin-bottom: 20px;">
+          <div class="header-filtros">
+            <h4 style="font-size: 14px; font-weight: 700; color: #f1f5f9;">Filtros de Consulta</h4>
+            
+            <div class="seletor-modo-lista">
+              <button 
+                @click="modoVisualizacao = 'compras'" 
+                :class="['btn-modo', { 'btn-modo-ativo': modoVisualizacao === 'compras' }]"
+              >
+                🗂️ Agrupado por Compra
+              </button>
+              <button 
+                @click="modoVisualizacao = 'parcelas'" 
+                :class="['btn-modo', { 'btn-modo-ativo': modoVisualizacao === 'parcelas' }]"
+              >
+                📅 Visão Cronológica
+              </button>
+            </div>
+          </div>
+
+          <div class="grid-filtros-campos">
+            <div style="flex: 1; min-width: 200px;">
+              <label class="rotulo">Distribuidora:</label>
+              <input 
+                v-model="filtroDistribuidora" 
+                @input="aplicarFiltroComDebounce" 
+                type="text" 
+                placeholder="Buscar por fornecedor..." 
+                class="input-cockpit"
+              >
+            </div>
+            <div style="width: 140px;">
+              <label class="rotulo">Vencimento em:</label>
+              <input 
+                v-model.number="filtroDiasVencimento" 
+                @input="aplicarFiltroComDebounce" 
+                type="number" 
+                min="0" 
+                placeholder="Ex: 30 dias" 
+                class="input-cockpit"
+              >
+            </div>
+            <div style="width: 160px;">
+              <label class="rotulo">Status:</label>
+              <select v-model="filtroStatus" @change="carregarGestao" class="input-cockpit">
+                <option value="Aberto">Em Aberto</option>
+                <option value="Pago">Quitados</option>
+                <option value="Todos">Todos os Status</option>
+              </select>
+            </div>
+            <button @click="limparFiltros" class="btn-limpar-cockpit">Limpar</button>
+          </div>
+        </div>
+
+        <div v-if="erroDeConexao" class="alerta-erro">
+          Erro de conexão: {{ erroDeConexao }}
+        </div>
+        
+        <div v-else-if="boletosGestao.length === 0" class="alerta-vazio">
+          Nenhum registro encontrado para este filtro.
+        </div>
+
+        <!-- MODO 1: CARDS AGRUPADOS -->
+        <div v-else-if="modoVisualizacao === 'compras'" class="grid-compras-organizado">
+          <div 
+            v-for="compra in comprasAgrupadas" 
+            :key="compra.chave" 
+            class="card-compra-moderno"
+          >
+            <div class="compra-topo">
+              <div>
+                <div class="linha-titulo-nota">
+                  <h3 class="nome-distribuidora">{{ compra.distribuidora }}</h3>
+                  <span class="badge-nota">NF: {{ compra.numero_nota }}</span>
+                </div>
+                <div class="periodo-compra">
+                  <span>📅 {{ formatarDataBR(compra.data_inicio) }}</span>
+                  <span class="seta-separador">➔</span>
+                  <span>🏁 {{ formatarDataBR(compra.data_termino) }}</span>
+                  <span class="separador-ponto">•</span>
+                  <span>{{ compra.total_parcelas }} parcela(s)</span>
+                </div>
+              </div>
+
+              <div class="topo-acoes-compra">
+                <span 
+                  :class="['badge-progresso', compra.qtd_pagas === compra.total_parcelas ? 'badge-concluido' : 'badge-pendente']"
+                >
+                  {{ compra.qtd_pagas }} de {{ compra.total_parcelas }} quitadas
+                </span>
+
+                <button 
+                  @click="apagarCompra(compra)" 
+                  class="btn-apagar-compra" 
+                  title="Apagar esta compra inteira"
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    <line x1="10" y1="11" x2="10" y2="17"></line>
+                    <line x1="14" y1="11" x2="14" y2="17"></line>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="trilho-progresso-card">
+              <div 
+                class="barra-progresso-card" 
+                :style="{ width: ((compra.qtd_pagas / compra.total_parcelas) * 100) + '%' }"
+              ></div>
+            </div>
+
+            <div class="grid-resumo-3colunas">
+              <div class="bloco-valor">
+                <span class="rotulo-mini">Valor Total</span>
+                <strong class="valor-destaque-total">{{ formatarMoeda(compra.valor_total) }}</strong>
+              </div>
+              <div class="bloco-valor">
+                <span class="rotulo-mini">Já Quitado</span>
+                <strong class="valor-destaque-pago">{{ formatarMoeda(compra.total_pago) }}</strong>
+              </div>
+              <div class="bloco-valor">
+                <span class="rotulo-mini">Pendente</span>
+                <strong class="valor-destaque-pendente">{{ formatarMoeda(compra.total_pendente) }}</strong>
+              </div>
+            </div>
+
+            <div class="rodape-card-compra">
+              <button @click="alternarExpansao(compra.chave)" class="btn-toggle-parcelas">
+                <span>{{ comprasExpandidas[compra.chave] ? 'Ocultar Parcelas' : 'Visualizar Parcelas' }} ({{ compra.parcelas.length }})</span>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" :style="{ transform: comprasExpandidas[compra.chave] ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }">
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+              </button>
+            </div>
+
+            <div v-if="comprasExpandidas[compra.chave]" class="container-subparcelas">
+              <div 
+                v-for="p in compra.parcelas" 
+                :key="p.id" 
+                :class="['subcard-parcela', p.status === 'Pago' ? 'parcela-paga' : 'parcela-aberta']"
+              >
+                <div>
+                  <span style="font-weight: 700; color: #f8fafc;">Parcela {{ p.parcela_atual }}/{{ p.total_parcelas }}</span>
+                  <span class="separador-ponto">•</span>
+                  <span>Venc: <strong style="color: #00d2ff;">{{ formatarDataBR(p.data_vencimento) }}</strong></span>
+                </div>
+
+                <div class="acoes-parcela">
+                  <span class="valor-parcela-item">{{ formatarMoeda(p.valor_parcela) }}</span>
+                  <span :class="['pill-status', p.status === 'Pago' ? 'pill-pago' : 'pill-aberto']">
+                    {{ p.status === 'Pago' ? 'PAGO' : 'ABERTO' }}
+                  </span>
+                  <button 
+                    v-if="p.status === 'Aberto'" 
+                    @click="marcarComoPago(p.id)" 
+                    class="btn-quitar-neon"
+                  >
+                    ✓ Quitar
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- MODO 2: VISÃO CRONOLÓGICA -->
+        <div v-else class="grid-compras-organizado">
+          <div 
+            v-for="b in boletosGestao" 
+            :key="b.id" 
+            :class="['card-cronologico', b.status === 'Pago' ? 'parcela-paga' : 'parcela-aberta']"
+          >
+            <div class="linha-topo-cronologico">
+              <div>
+                <strong style="font-size: 16px; color: #f8fafc;">{{ b.distribuidora }}</strong>
+                <span class="badge-nota" style="margin-left: 8px;">NF: {{ b.numero_nota }}</span>
+              </div>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <span class="badge-progresso badge-pendente">Parcela {{ b.parcela_atual }} de {{ b.total_parcelas }}</span>
+                <button v-if="b.status === 'Aberto'" @click="marcarComoPago(b.id)" class="btn-quitar-neon">✓ Quitar</button>
+              </div>
+            </div>
+
+            <div style="font-size: 13px; color: #94a3b8; margin: 10px 0;">
+              Vencimento: <strong style="color: #00d2ff;">{{ formatarDataBR(b.data_vencimento) }}</strong> 
+              <span class="separador-ponto">•</span>
+              Período: {{ formatarDataBR(b.compra_resumo.data_inicio) }} ➔ {{ formatarDataBR(b.compra_resumo.data_termino) }}
+            </div>
+
+            <div class="rodape-cronologico">
+              <span>Parcela: <strong style="color: #00d2ff;">{{ formatarMoeda(b.valor_parcela) }}</strong></span>
+              <span>Total da Compra: <strong style="color: #f1f5f9;">{{ formatarMoeda(b.compra_resumo.valor_total) }}</strong></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- TOAST DE DESFAZER EXCLUSÃO -->
+    <transition name="toast-anim">
+      <div v-if="toastUndo.visivel" class="toast-undo-container">
+        <div class="toast-undo-conteudo">
+          <div class="toast-info">
+            <span class="icone-alerta-toast">🗑️</span>
+            <span>{{ toastUndo.mensagem }}</span>
+          </div>
+
+          <div class="toast-botoes">
+            <button @click="desfazerExclusao" class="btn-desfazer-toast">
+              ↩️ Desfazer ({{ toastUndo.tempoRestante }}s)
+            </button>
+            <button @click="fecharToast" class="btn-fechar-toast" title="Dispensar">
+              ✖
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+  </div>
+</template>
+
+<style scoped>
+.layout-app {
+  max-width: 1140px;
+  margin: 0 auto;
+  padding: 24px 20px;
+  position: relative;
+}
+
+.header-principal {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.marca-app {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.icone-logo {
+  width: 70px;
+  height: 70px;
+  border-radius: 16px;
+  box-shadow: 0 0 20px rgba(0, 210, 255, 0.4);
+  transition: transform 0.2s ease;
+}
+
+.icone-logo:hover {
+  transform: scale(1.03);
+}
+
+.linha-marca {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.titulo-app {
+  font-size: 26px;
+  font-weight: 800;
+  color: #f8fafc;
+  letter-spacing: -0.5px;
+}
+
+.destaque-vision {
+  background: linear-gradient(135deg, #00d2ff, #10b981);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.badge-versao {
+  background: #1e293b;
+  color: #00d2ff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+}
+
+.subtitulo-app {
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.nav-segmentada {
+  display: flex;
+  background: #0f172a;
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid #1e293b;
+  gap: 4px;
+}
+
+.btn-aba {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-aba-ativa {
+  background: #1e293b;
+  color: #00d2ff;
+  box-shadow: 0 0 10px rgba(0, 210, 255, 0.15);
+}
+
+.banner-hero {
+  background: linear-gradient(135deg, #0f172a 0%, #111d38 100%);
+  border: 1px solid #1e293b;
+  border-radius: 16px;
+  padding: 22px 26px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 24px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+.titulo-hero {
+  font-size: 20px;
+  font-weight: 800;
+  color: #f8fafc;
+}
+
+.desc-hero {
+  font-size: 13px;
+  color: #94a3b8;
+  margin-top: 2px;
+}
+
+.btn-excel-topo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+  transition: transform 0.2s;
+}
+
+.btn-excel-topo:hover {
+  transform: translateY(-1px);
+}
+
+.grid-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px;
+  margin-bottom: 24px;
+}
+
+.card-kpi {
+  background: #0f172a;
+  padding: 20px;
+  border-radius: 16px;
+  border: 1px solid #1e293b;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+}
+
+.glow-ciano { border-color: rgba(0, 210, 255, 0.3); }
+.glow-esmeralda { border-color: rgba(16, 185, 129, 0.3); }
+.glow-indigo { border-color: rgba(99, 102, 241, 0.3); }
+
+.kpi-icone {
+  width: 50px;
+  height: 50px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.icone-ciano { background: rgba(0, 210, 255, 0.1); color: #00d2ff; }
+.icone-esmeralda { background: rgba(16, 185, 129, 0.1); color: #10b981; }
+.icone-indigo { background: rgba(99, 102, 241, 0.1); color: #818cf8; }
+
+.kpi-rotulo {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #94a3b8;
+  display: block;
+}
+
+.kpi-valor {
+  font-size: 24px;
+  font-weight: 800;
+  color: #f8fafc;
+  margin-top: 2px;
+}
+
+.valor-ciano { color: #00d2ff; text-shadow: 0 0 10px rgba(0, 210, 255, 0.25); }
+.valor-esmeralda { color: #10b981; text-shadow: 0 0 10px rgba(16, 185, 129, 0.25); }
+.valor-indigo { color: #818cf8; }
+
+.barra-topo-gestao {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.btn-toggle-novo {
+  padding: 9px 18px;
+  background: linear-gradient(135deg, #0284c7, #00d2ff);
+  color: #080d1a;
+  border: none;
+  border-radius: 8px;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 0 15px rgba(0, 210, 255, 0.3);
+  transition: all 0.2s ease;
+}
+
+.btn-toggle-novo:hover {
+  transform: translateY(-1px);
+}
+
+.btn-toggle-ativo {
+  background: #334155;
+  color: #f8fafc;
+  box-shadow: none;
+}
+
+.card-cockpit {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 16px;
+  padding: 22px;
+  margin-bottom: 20px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+.painel-animado {
+  animation: slideDown 0.25s ease-out;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.card-topo-titulo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.circulo-icone {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.grid-formulario {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+}
+
+.campo-grupo {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.rotulo {
+  font-size: 13px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.input-cockpit {
+  padding: 9px 12px;
+  background: #131c31;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  font-size: 14px;
+  color: #f8fafc;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.input-cockpit:focus {
+  border-color: #00d2ff;
+  box-shadow: 0 0 10px rgba(0, 210, 255, 0.2);
+}
+
+.area-submit {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+}
+
+.btn-gradiente-acao {
+  width: 100%;
+  padding: 12px;
+  background: linear-gradient(135deg, #0284c7, #00d2ff);
+  color: #080d1a;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: 0 0 15px rgba(0, 210, 255, 0.3);
+}
+
+.header-filtros {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.seletor-modo-lista {
+  display: flex;
+  background: #131c31;
+  padding: 3px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+}
+
+.btn-modo {
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.btn-modo-ativo {
+  background: #1e293b;
+  color: #00d2ff;
+}
+
+.grid-filtros-campos {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.btn-limpar-cockpit {
+  padding: 9px 15px;
+  background: #1e293b;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.grid-compras-organizado {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 600px) {
+  .grid-compras-organizado {
+    grid-template-columns: 1fr;
+  }
+}
+
+.card-compra-moderno {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 14px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.15);
+  transition: border-color 0.2s ease;
+}
+
+.card-compra-moderno:hover {
+  border-color: rgba(0, 210, 255, 0.4);
+}
+
+.compra-topo {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.linha-titulo-nota {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nome-distribuidora {
+  font-size: 17px;
+  font-weight: 800;
+  color: #f8fafc;
+}
+
+.badge-nota {
+  background: #1e293b;
+  color: #00d2ff;
+  border: 1px solid #334155;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.periodo-compra {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+  color: #94a3b8;
+  margin-top: 4px;
+}
+
+.seta-separador { color: #00d2ff; font-size: 11px; }
+.separador-ponto { color: #475569; }
+
+.topo-acoes-compra {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge-progresso {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.badge-pendente {
+  background: rgba(0, 210, 255, 0.1);
+  color: #00d2ff;
+  border: 1px solid rgba(0, 210, 255, 0.25);
+}
+
+.badge-concluido {
+  background: rgba(16, 185, 129, 0.1);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.25);
+}
+
+.btn-apagar-compra {
+  background: #1e293b;
+  border: 1px solid #334155;
+  color: #94a3b8;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-apagar-compra:hover {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+  border-color: #ef4444;
+  transform: scale(1.05);
+}
+
+.trilho-progresso-card {
+  height: 5px;
+  background: #1e293b;
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.barra-progresso-card {
+  height: 100%;
+  background: linear-gradient(90deg, #00d2ff, #10b981);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.grid-resumo-3colunas {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  background: #131c31;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #1e293b;
+  margin-bottom: 12px;
+}
+
+.bloco-valor {
+  text-align: center;
+}
+
+.rotulo-mini {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #94a3b8;
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+
+.valor-destaque-total { font-size: 15px; color: #f8fafc; }
+.valor-destaque-pago { font-size: 15px; color: #10b981; }
+.valor-destaque-pendente { font-size: 15px; color: #ef4444; }
+
+.btn-toggle-parcelas {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  background: #131c31;
+  border: 1px solid #334155;
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #00d2ff;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.btn-toggle-parcelas:hover {
+  background: #1a2540;
+}
+
+.container-subparcelas {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed #334155;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.subcard-parcela {
+  padding: 8px 12px;
+  border-radius: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  background: #131c31;
+}
+
+.parcela-aberta { border: 1px solid #1e293b; border-left: 3px solid #00d2ff; }
+.parcela-paga { border: 1px solid #1e293b; border-left: 3px solid #10b981; }
+
+.acoes-parcela {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.valor-parcela-item {
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.pill-status {
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.pill-aberto { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+.pill-pago { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+
+.btn-quitar-neon {
+  padding: 3px 10px;
+  background: #10b981;
+  color: #080d1a;
+  border: none;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.card-cronologico {
+  background: #0f172a;
+  padding: 14px 18px;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.linha-topo-cronologico {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.rodape-cronologico {
+  display: flex;
+  justify-content: space-between;
+  background: #131c31;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.alerta-erro {
+  padding: 14px;
+  background: rgba(239, 68, 68, 0.1);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.alerta-vazio {
+  text-align: center;
+  padding: 40px;
+  background: #0f172a;
+  border-radius: 12px;
+  border: 1px dashed #334155;
+  color: #94a3b8;
+}
+
+/* TOAST FLUTUANTE DE DESFAZER */
+.toast-undo-container {
+  position: fixed;
+  bottom: 25px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+}
+
+.toast-undo-conteudo {
+  background: #1e293b;
+  border: 1px solid #38bdf8;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 20px rgba(0, 210, 255, 0.25);
+  padding: 12px 20px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  color: #f8fafc;
+  font-size: 14px;
+}
+
+.toast-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.icone-alerta-toast {
+  font-size: 18px;
+}
+
+.toast-botoes {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn-desfazer-toast {
+  background: linear-gradient(135deg, #0284c7, #00d2ff);
+  color: #080d1a;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.btn-desfazer-toast:hover {
+  transform: scale(1.05);
+}
+
+.btn-fechar-toast {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px;
+}
+
+.btn-fechar-toast:hover {
+  color: #f8fafc;
+}
+
+.toast-anim-enter-active, .toast-anim-leave-active {
+  transition: all 0.3s ease;
+}
+.toast-anim-enter-from, .toast-anim-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 20px);
+}
+</style>
+
+
+============================================================
+CAMINHO DO FICHEIRO: frontend/src\main.js
+============================================================
+
+import { createApp } from 'vue'
+import './style.css'
+import App from './App.vue'
+
+createApp(App).mount('#app')
+
+
+
+============================================================
+CAMINHO DO FICHEIRO: frontend/src\style.css
+============================================================
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background-color: #080d1a; /* Dark Cockpit inspirado no fundo do ícone */
+  color: #f1f5f9;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+#app {
+  width: 100%;
+  min-height: 100vh;
+}
+
+input, select, button, textarea {
+  font-family: inherit;
+}
+
+/* Scrollbar refinada */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0b1329;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+
+============================================================
+CAMINHO DO FICHEIRO: frontend/src\components\GraficoMensal.vue
+============================================================
+
+<script setup>
+import { ref, computed, watch } from 'vue'
+import { Doughnut, Bar, Line } from 'vue-chartjs'
+import { 
+  Chart as ChartJS, Title, Tooltip, Legend, ArcElement, 
+  BarElement, CategoryScale, LinearScale, PointElement, LineElement, Filler 
+} from 'chart.js'
+
+ChartJS.register(
+  Title, Tooltip, Legend, ArcElement, 
+  BarElement, CategoryScale, LinearScale, PointElement, LineElement, Filler
+)
+
+const props = defineProps({
+  boletos: {
+    type: Array,
+    required: true
+  }
+})
+
+const tipoGrafico = ref('donut')
+
+const paletaCores = [
+  '#00d2ff', '#10b981', '#6366f1', '#f59e0b', '#ec4899',
+  '#06b6d4', '#14b8a6', '#8b5cf6', '#3b82f6', '#f43f5e'
+]
+
+const gerarCor = (index) => {
+  if (index < paletaCores.length) return paletaCores[index]
+  const hue = (index * 137.5) % 360
+  return `hsl(${Math.round(hue)}, 80%, 55%)`
+}
+
+const formatarMes = (anoMes) => {
+  if (!anoMes) return ''
+  const partes = anoMes.split('-')
+  if (partes.length < 2) return anoMes
+  const mesesNomes = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez']
+  const mesIndex = parseInt(partes[1], 10) - 1
+  return `${mesesNomes[mesIndex] || partes[1]} / ${partes[0]}`
+}
+
+const formatarMoeda = (val) => {
+  return Number(val || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+}
+
+// Meses com contas em aberto
+const mesesDisponiveis = computed(() => {
+  const meses = new Set()
+  props.boletos.forEach(b => {
+    if (b.data_vencimento && b.status !== 'Pago') {
+      meses.add(b.data_vencimento.substring(0, 7))
+    }
+  })
+  return Array.from(meses).sort()
+})
+
+const mesSelecionado = ref('')
+
+// Prioriza o mês atual; se não houver pendências nele, pega o primeiro com pendências
+watch(mesesDisponiveis, (novosMeses) => {
+  if (novosMeses.length > 0) {
+    const mesAtualIso = new Date().toISOString().substring(0, 7)
+    if (novosMeses.includes(mesAtualIso)) {
+      mesSelecionado.value = mesAtualIso
+    } else if (!mesSelecionado.value || !novosMeses.includes(mesSelecionado.value)) {
+      mesSelecionado.value = novosMeses[0]
+    }
+  } else {
+    mesSelecionado.value = ''
+  }
+}, { immediate: true })
+
+const analiseFornecedoresMes = computed(() => {
+  const totais = {}
+  let totalGeralMes = 0
+
+  props.boletos.forEach(b => {
+    const mesAno = b.data_vencimento ? b.data_vencimento.substring(0, 7) : ''
+    if (mesAno === mesSelecionado.value && b.status !== 'Pago') {
+      const dist = b.distribuidora || 'Outros'
+      totais[dist] = (totais[dist] || 0) + b.valor_parcela
+      totalGeralMes += b.valor_parcela
+    }
+  })
+
+  const lista = Object.keys(totais).map((dist, idx) => ({
+    distribuidora: dist,
+    valor: totais[dist],
+    porcentagem: totalGeralMes > 0 ? ((totais[dist] / totalGeralMes) * 100).toFixed(1) : '0.0',
+    cor: gerarCor(idx)
+  })).sort((a, b) => b.valor - a.valor)
+
+  return { lista, totalGeralMes }
+})
+
+const dadosDonut = computed(() => {
+  const { lista } = analiseFornecedoresMes.value
+  return {
+    labels: lista.map(i => i.distribuidora),
+    datasets: [{
+      backgroundColor: lista.map(i => i.cor),
+      data: lista.map(i => i.valor),
+      borderWidth: 2,
+      borderColor: '#0f172a',
+      hoverOffset: 8
+    }]
+  }
+})
+
+const dadosBarras = computed(() => {
+  const { lista } = analiseFornecedoresMes.value
+  return {
+    labels: lista.map(i => i.distribuidora),
+    datasets: [{
+      label: 'Valor a Pagar',
+      backgroundColor: lista.map(i => i.cor),
+      borderRadius: 6,
+      data: lista.map(i => i.valor)
+    }]
+  }
+})
+
+const dadosLinhaDoTempo = computed(() => {
+  const totaisPorMes = {}
+
+  props.boletos.forEach(b => {
+    if (b.data_vencimento && b.status !== 'Pago') {
+      const mesAno = b.data_vencimento.substring(0, 7)
+      totaisPorMes[mesAno] = (totaisPorMes[mesAno] || 0) + b.valor_parcela
+    }
+  })
+
+  const mesesOrdenados = Object.keys(totaisPorMes).sort()
+  return {
+    labels: mesesOrdenados.map(formatarMes),
+    datasets: [{
+      label: 'Total de Contas a Pagar',
+      borderColor: '#00d2ff',
+      backgroundColor: 'rgba(0, 210, 255, 0.12)',
+      borderWidth: 3,
+      fill: true,
+      tension: 0.35,
+      pointBackgroundColor: '#10b981',
+      pointBorderColor: '#ffffff',
+      pointRadius: 5,
+      pointHoverRadius: 7,
+      data: mesesOrdenados.map(m => totaisPorMes[m])
+    }]
+  }
+})
+
+const opcoesDonut = {
+  responsive: true,
+  maintainAspectRatio: false,
+  cutout: '74%',
+  plugins: {
+    legend: { display: false },
+    tooltip: {
+      backgroundColor: '#0f172a',
+      borderColor: '#334155',
+      borderWidth: 1,
+      padding: 12,
+      callbacks: { label: (c) => ` ${formatarMoeda(c.parsed)}` }
+    }
+  }
+}
+
+const opcoesGeraisCartesianas = {
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: {
+    legend: { display: false },
+    tooltip: {
+      backgroundColor: '#0f172a',
+      borderColor: '#334155',
+      borderWidth: 1,
+      padding: 12,
+      callbacks: { label: (c) => ` ${formatarMoeda(c.parsed.y !== undefined ? c.parsed.y : c.parsed)}` }
+    }
+  },
+  scales: {
+    x: {
+      ticks: { color: '#94a3b8', font: { size: 11 } },
+      grid: { color: '#1e293b' }
+    },
+    y: {
+      ticks: { 
+        color: '#94a3b8', 
+        callback: (val) => 'R$ ' + Number(val).toLocaleString('pt-BR') 
+      },
+      grid: { color: '#1e293b' }
+    }
+  }
+}
+</script>
+
+<template>
+  <div class="card-grafico">
+    <div class="header-grafico">
+      <div>
+        <h3 class="titulo-secao">Análise Financeira de Despesas</h3>
+        <p class="subtitulo-secao">Escolha o modo de visualização mais conveniente</p>
+      </div>
+
+      <div class="controles-grafico">
+        <div class="seletor-estilo-grafico">
+          <button 
+            @click="tipoGrafico = 'donut'" 
+            :class="['btn-tipo-grafico', { 'btn-tipo-ativo': tipoGrafico === 'donut' }]"
+          >
+            🍩 Rosca
+          </button>
+          <button 
+            @click="tipoGrafico = 'barras'" 
+            :class="['btn-tipo-grafico', { 'btn-tipo-ativo': tipoGrafico === 'barras' }]"
+          >
+            📊 Barras
+          </button>
+          <button 
+            @click="tipoGrafico = 'timeline'" 
+            :class="['btn-tipo-grafico', { 'btn-tipo-ativo': tipoGrafico === 'timeline' }]"
+          >
+            📈 Linha do Tempo
+          </button>
+        </div>
+
+        <div v-if="tipoGrafico !== 'timeline' && mesesDisponiveis.length > 0" class="seletor-container">
+          <span class="label-seletor">Mês:</span>
+          <select v-model="mesSelecionado" class="select-mes">
+            <option v-for="mes in mesesDisponiveis" :key="mes" :value="mes">
+              {{ formatarMes(mes) }}
+            </option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODO 1: GRÁFICO DONUT -->
+    <div v-if="tipoGrafico === 'donut'">
+      <div v-if="analiseFornecedoresMes.lista.length === 0" class="estado-vazio">
+        <div class="icone-vazio">✨</div>
+        <p style="font-weight: 600; color: #f1f5f9;">Sem contas pendentes para este mês</p>
+      </div>
+      <div v-else class="grid-grafico-detalhes">
+        <div class="container-donut">
+          <div class="donut-wrapper">
+            <Doughnut :key="mesSelecionado" :data="dadosDonut" :options="opcoesDonut" />
+            <div class="centro-donut">
+              <span class="label-centro">Total do Mês</span>
+              <span class="valor-centro">{{ formatarMoeda(analiseFornecedoresMes.totalGeralMes) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="lista-fornecedores">
+          <div 
+            v-for="item in analiseFornecedoresMes.lista" 
+            :key="item.distribuidora"
+            class="item-fornecedor"
+          >
+            <div class="info-topo">
+              <div class="nome-empresa">
+                <span class="ponto-cor" :style="{ backgroundColor: item.cor, boxShadow: `0 0 8px ${item.cor}` }"></span>
+                <strong>{{ item.distribuidora }}</strong>
+              </div>
+              <div class="valores-empresa">
+                <span class="valor-texto">{{ formatarMoeda(item.valor) }}</span>
+                <span class="porcentagem-texto">{{ item.porcentagem }}%</span>
+              </div>
+            </div>
+            <div class="trilho-progresso">
+              <div class="barra-progresso" :style="{ width: item.porcentagem + '%', backgroundColor: item.cor }"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODO 2: BARRAS POR FORNECEDOR -->
+    <div v-else-if="tipoGrafico === 'barras'" style="height: 290px;">
+      <div v-if="analiseFornecedoresMes.lista.length === 0" class="estado-vazio">
+        <div class="icone-vazio">✨</div>
+        <p style="font-weight: 600; color: #f1f5f9;">Sem contas pendentes para este mês</p>
+      </div>
+      <Bar v-else :key="mesSelecionado" :data="dadosBarras" :options="opcoesGeraisCartesianas" />
+    </div>
+
+    <!-- MODO 3: LINHA DO TEMPO -->
+    <div v-else-if="tipoGrafico === 'timeline'" style="height: 290px;">
+      <div v-if="dadosLinhaDoTempo.labels.length === 0" class="estado-vazio">
+        <div class="icone-vazio">✨</div>
+        <p style="font-weight: 600; color: #f1f5f9;">Sem contas pendentes para projetar no calendário</p>
+      </div>
+      <Line v-else :data="dadosLinhaDoTempo" :options="opcoesGeraisCartesianas" />
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.card-grafico {
+  background: #0f172a;
+  padding: 24px;
+  border-radius: 16px;
+  border: 1px solid #1e293b;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  margin-bottom: 24px;
+}
+
+.header-grafico {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 15px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid #1e293b;
+  padding-bottom: 16px;
+}
+
+.titulo-secao {
+  font-size: 18px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.subtitulo-secao {
+  font-size: 13px;
+  color: #94a3b8;
+  margin-top: 2px;
+}
+
+.controles-grafico {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.seletor-estilo-grafico {
+  display: flex;
+  background: #131c31;
+  padding: 3px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  gap: 2px;
+}
+
+.btn-tipo-grafico {
+  padding: 5px 12px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-tipo-ativo {
+  background: #1e293b;
+  color: #00d2ff;
+  box-shadow: 0 0 8px rgba(0, 210, 255, 0.15);
+}
+
+.seletor-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #1e293b;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+}
+
+.label-seletor {
+  font-size: 13px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.select-mes {
+  border: 1px solid #334155;
+  background: #0f172a;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #00d2ff;
+  cursor: pointer;
+  outline: none;
+}
+
+.grid-grafico-detalhes {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: 30px;
+  align-items: center;
+}
+
+@media (max-width: 800px) {
+  .grid-grafico-detalhes {
+    grid-template-columns: 1fr;
+  }
+}
+
+.container-donut {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.donut-wrapper {
+  position: relative;
+  width: 240px;
+  height: 240px;
+}
+
+.centro-donut {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  pointer-events: none;
+}
+
+.label-centro {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #94a3b8;
+}
+
+.valor-centro {
+  display: block;
+  font-size: 17px;
+  font-weight: 800;
+  color: #00d2ff;
+  margin-top: 2px;
+}
+
+.lista-fornecedores {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.item-fornecedor {
+  background: #131c31;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid #1e293b;
+}
+
+.info-topo {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.nome-empresa {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #f1f5f9;
+}
+
+.ponto-cor {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.valores-empresa {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.valor-texto {
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.porcentagem-texto {
+  font-size: 12px;
+  font-weight: 600;
+  color: #94a3b8;
+  min-width: 45px;
+  text-align: right;
+}
+
+.trilho-progresso {
+  height: 6px;
+  background: #1e293b;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.barra-progresso {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.estado-vazio {
+  text-align: center;
+  padding: 40px 20px;
+  background: #131c31;
+  border-radius: 12px;
+  border: 1px dashed #334155;
+}
+
+.icone-vazio {
+  font-size: 32px;
+  margin-bottom: 8px;
+}
+</style>
+
